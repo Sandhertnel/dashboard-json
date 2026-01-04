@@ -4,8 +4,8 @@ from collections import Counter
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Dashboard Trello (Cards + Texto)", layout="wide")
-st.title("Dashboard Trello — Tratamento de Conteúdo dos Cards")
+st.set_page_config(page_title="Dashboard Trello (Conteúdo dos Cards)", layout="wide")
+st.title("Dashboard Trello — Conteúdo dos Cards (name + desc)")
 
 # -----------------------------
 # Upload
@@ -22,42 +22,18 @@ except Exception as e:
     st.stop()
 
 # -----------------------------
-# Extrair cards e actions
+# Extrair cards (sem actions)
 # -----------------------------
 cards = data.get("cards", [])
-actions = data.get("actions", [])
 
 if not isinstance(cards, list) or not cards:
     st.error("Não encontrei data['cards'] no JSON. Confirme que é export do Trello (board).")
     st.stop()
 
-cards_df = pd.json_normalize(cards, sep=".")
-
-# Comentários: actions.type == commentCard  -> data.text + data.card.id
-comments = []
-if isinstance(actions, list) and actions:
-    for a in actions:
-        if isinstance(a, dict) and a.get("type") == "commentCard":
-            d = a.get("data", {}) or {}
-            card = d.get("card", {}) or {}
-            comments.append({
-                "card_id": card.get("id"),
-                "comment_text": d.get("text"),
-                "comment_date": a.get("date"),
-            })
-
-comments_df = pd.DataFrame(comments)
-
-# Agrupar comentários por card_id
-if not comments_df.empty:
-    comments_df["comment_text"] = comments_df["comment_text"].fillna("").astype(str)
-    agg = comments_df.groupby("card_id")["comment_text"].apply(lambda x: " \n".join([t for t in x if t.strip()]))
-    comments_map = agg.to_dict()
-else:
-    comments_map = {}
+df = pd.json_normalize(cards, sep=".")
 
 # -----------------------------
-# Funções de limpeza e classificação
+# Limpeza e classificação (baseline)
 # -----------------------------
 def clean_text(s: str) -> str:
     s = "" if s is None else str(s)
@@ -71,13 +47,12 @@ def norm_for_rules(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
-# Regras simples e eficazes (baseline)
 TRUCK_KW = ["caminhao", "caminhão", "axor", "atego", "mb", "mercedes", "scania", "volvo", "carreta", "bitrem", "truck"]
-VEIC_KW  = ["carro", "passeio", "hb20", "onix", "gol", "palio", "civic", "corolla", "moto", "motocicleta"]
+VEIC_KW  = ["carro", "passeio", "hb20", "onix", "gol", "palio", "civic", "corolla", "moto", "motocicleta", "utilitario", "utilitário"]
 
 CATEGORIAS = {
-    "Acidente": ["acidente", "colis", "batida", "capot", "tombou", "saiu da pista"],
-    "Pane elétrica": ["pane eletrica", "pane elétrica", "bateria", "alternador", "não dá partida", "nao da partida", "curto", "fiação", "fiação"],
+    "Acidente": ["acidente", "colis", "batida", "capot", "tombou", "saiu da pista", "sinistro"],
+    "Pane elétrica": ["pane eletrica", "pane elétrica", "bateria", "alternador", "não dá partida", "nao da partida", "curto", "fiação", "fiacao"],
     "Pane mecânica": ["pane mecanica", "pane mecânica", "motor", "cambio", "câmbio", "embreagem", "superaquec", "quebrou", "vazamento"],
     "Guincho/Remoção": ["guincho", "reboque", "remoção", "remocao", "plataforma", "prancha"],
     "Pneu": ["pneu", "estouro", "furou", "estepe", "calibr"],
@@ -85,9 +60,8 @@ CATEGORIAS = {
 }
 
 def classificar_tipo_veiculo(texto_norm: str) -> str:
-    t = texto_norm
-    truck = any(k in t for k in TRUCK_KW)
-    veic  = any(k in t for k in VEIC_KW)
+    truck = any(k in texto_norm for k in TRUCK_KW)
+    veic  = any(k in texto_norm for k in VEIC_KW)
     if truck and not veic:
         return "Truck"
     if veic and not truck:
@@ -103,25 +77,119 @@ def classificar_categoria(texto_norm: str) -> str:
     return "Outros"
 
 # -----------------------------
-# Montar dataset final (texto_total)
+# Montar texto_total (name + desc)
 # -----------------------------
-# Campos comuns do Trello
-id_col = "id" if "id" in cards_df.columns else None
-name_col = "name" if "name" in cards_df.columns else None
-desc_col = "desc" if "desc" in cards_df.columns else None
-closed_col = "closed" if "closed" in cards_df.columns else None
-last_col = "dateLastActivity" if "dateLastActivity" in cards_df.columns else None
-closed_date_col = "dateClosed" if "dateClosed" in cards_df.columns else None
+name_col = "name" if "name" in df.columns else None
+desc_col = "desc" if "desc" in df.columns else None
+closed_col = "closed" if "closed" in df.columns else None
 
-df = cards_df.copy()
-
-if id_col is None:
-    st.error("Não encontrei coluna 'id' nos cards.")
-    st.stop()
+date_col = None
+for cand in ["dateLastActivity", "dateClosed", "dateCompleted", "date"]:
+    if cand in df.columns:
+        date_col = cand
+        break
 
 df["title"] = df[name_col].fillna("").astype(str) if name_col else ""
 df["desc_clean"] = df[desc_col].apply(clean_text) if desc_col else ""
-df["comments_clean"] = df[id_col].map(lambda cid: clean_text(comments_map.get(cid, "")))
+df["texto_total"] = (df["title"] + "\n" + df["desc_clean"]).str.strip()
+df["texto_norm"] = df["texto_total"].apply(norm_for_rules)
 
-df["texto_total"] = (df["title"].fillna("") + "\n" + df["desc_clean"].fillna("") + "\n" + df["comments_clean"].fillna("")).str.strip()
-df["texto_norm"] = df["texto_total"].apply(norm_for_rule_]()_]()
+df["tipo_veiculo"] = df["texto_norm"].apply(classificar_tipo_veiculo)
+df["categoria"] = df["texto_norm"].apply(classificar_categoria)
+
+if date_col:
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", utc=True).dt.tz_convert(None)
+
+# -----------------------------
+# Sidebar: filtros
+# -----------------------------
+st.sidebar.header("Filtros")
+
+df_f = df.copy()
+
+if date_col and df_f[date_col].notna().any():
+    min_d = df_f[date_col].min()
+    max_d = df_f[date_col].max()
+    d1, d2 = st.sidebar.date_input("Período", value=(min_d.date(), max_d.date()))
+    df_f = df_f[(df_f[date_col].dt.date >= d1) & (df_f[date_col].dt.date <= d2)]
+
+cats = sorted(df_f["categoria"].unique().tolist())
+sel_cats = st.sidebar.multiselect("Categoria", cats, default=cats)
+df_f = df_f[df_f["categoria"].isin(sel_cats)]
+
+tipos = sorted(df_f["tipo_veiculo"].unique().tolist())
+sel_tipos = st.sidebar.multiselect("Tipo de veículo", tipos, default=tipos)
+df_f = df_f[df_f["tipo_veiculo"].isin(sel_tipos)]
+
+# -----------------------------
+# Abas
+# -----------------------------
+tab1, tab2, tab3 = st.tabs(["Dados", "Indicadores", "Texto (insights)"])
+
+with tab1:
+    st.subheader("Prévia dos cards (conteúdo tratado)")
+    cols_show = []
+    for c in ["id", "name", "closed", date_col, "tipo_veiculo", "categoria"]:
+        if c and c in df_f.columns and c not in cols_show:
+            cols_show.append(c)
+
+    st.dataframe(df_f[cols_show + ["texto_total"]].head(50), use_container_width=True, height=420)
+
+    csv = df_f.to_csv(index=False).encode("utf-8")
+    st.download_button("Baixar CSV (filtrado)", csv, file_name="cards_tratados_filtrado.csv", mime="text/csv")
+
+with tab2:
+    st.subheader("Indicadores principais")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total de cards (filtrado)", f"{len(df_f):,}".replace(",", "."))
+
+    if closed_col:
+        fechados = int(df_f[closed_col].fillna(False).astype(bool).sum())
+        abertos = len(df_f) - fechados
+        c2.metric("Abertos", f"{abertos:,}".replace(",", "."))
+        c3.metric("Fechados", f"{fechados:,}".replace(",", "."))
+        pct = (fechados / len(df_f) * 100) if len(df_f) else 0
+        c4.metric("% Fechados", f"{pct:.1f}%".replace(".", ","))
+    else:
+        c2.metric("Abertos", "-")
+        c3.metric("Fechados", "-")
+        c4.metric("% Fechados", "-")
+
+    st.divider()
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.subheader("Cards por categoria")
+        st.bar_chart(df_f["categoria"].value_counts())
+
+    with colB:
+        st.subheader("Truck vs Veicular")
+        st.bar_chart(df_f["tipo_veiculo"].value_counts())
+
+    if date_col:
+        st.divider()
+        st.subheader(f"Evolução mensal ({date_col})")
+        serie = df_f.dropna(subset=[date_col]).groupby(pd.Grouper(key=date_col, freq="M")).size().sort_index()
+        st.line_chart(serie)
+
+with tab3:
+    st.subheader("Insights do texto (palavras frequentes)")
+
+    texto = " ".join(df_f["texto_norm"].fillna("").tolist())
+    tokens = re.findall(r"[a-zà-ú0-9]{3,}", texto, flags=re.IGNORECASE)
+
+    stop = set([
+        "para","com","não","nao","uma","que","por","sem","mais","muito","onde","foi","vai","já","ja",
+        "dos","das","ele","ela","seu","sua","nos","nós","sim","aos","de","do","da","em","no","na",
+        "um","e","ou","ao","à","as","os","o","a","boa","tarde","dia","noite","favor","preciso",
+        "segue","ola","olá","atendimento","protocolo","informacoes","informações","veiculo","veículo"
+    ])
+
+    tokens = [t.lower() for t in tokens if t.lower() not in stop]
+    top = Counter(tokens).most_common(40)
+
+    top_df = pd.DataFrame(top, columns=["termo", "freq"])
+    st.dataframe(top_df, use_container_width=True, height=420)
+
+    st.caption("Se quiser, eu adiciono um painel de 'exemplos' (cards que mais citam cada termo/categoria).")
