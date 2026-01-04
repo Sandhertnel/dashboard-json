@@ -1,143 +1,127 @@
 import json
+import re
+from collections import Counter
 import pandas as pd
 import streamlit as st
 
-# Configuração da página
-st.set_page_config(
-    page_title="Dashboard JSON",
-    layout="wide"
-)
+st.set_page_config(page_title="Dashboard Trello (Cards + Texto)", layout="wide")
+st.title("Dashboard Trello — Tratamento de Conteúdo dos Cards")
 
-st.title("Dashboard de Análise de JSON")
-
-# Upload do arquivo JSON
-uploaded_file = st.file_uploader(
-    "Faça upload do arquivo JSON",
-    type=["json"]
-)
-
-if uploaded_file is None:
-    st.info("Envie um arquivo JSON para iniciar a análise.")
+# -----------------------------
+# Upload
+# -----------------------------
+uploaded = st.file_uploader("Envie o JSON exportado do Trello", type=["json"])
+if not uploaded:
+    st.info("Envie o arquivo .json para iniciar.")
     st.stop()
 
-# Leitura do JSON
 try:
-    dados = json.load(uploaded_file)
-except Exception as erro:
-    st.error(f"Erro ao ler o arquivo JSON: {erro}")
+    data = json.load(uploaded)
+except Exception as e:
+    st.error(f"Erro ao ler JSON: {e}")
     st.stop()
 
-# Função para localizar a lista principal de registros
-def encontrar_registros(obj):
-    if isinstance(obj, list):
-        return obj
+# -----------------------------
+# Extrair cards e actions
+# -----------------------------
+cards = data.get("cards", [])
+actions = data.get("actions", [])
 
-    if isinstance(obj, dict):
-        listas = []
-        for chave, valor in obj.items():
-            if isinstance(valor, list) and valor and isinstance(valor[0], dict):
-                listas.append((chave, valor, len(valor)))
+if not isinstance(cards, list) or not cards:
+    st.error("Não encontrei data['cards'] no JSON. Confirme que é export do Trello (board).")
+    st.stop()
 
-        if listas:
-            listas.sort(key=lambda x: x[2], reverse=True)
-            chave, lista, _ = listas[0]
-            st.caption(f"Registros detectados em: dados['{chave}']")
-            return lista
+cards_df = pd.json_normalize(cards, sep=".")
 
-    return []
+# Comentários: actions.type == commentCard  -> data.text + data.card.id
+comments = []
+if isinstance(actions, list) and actions:
+    for a in actions:
+        if isinstance(a, dict) and a.get("type") == "commentCard":
+            d = a.get("data", {}) or {}
+            card = d.get("card", {}) or {}
+            comments.append({
+                "card_id": card.get("id"),
+                "comment_text": d.get("text"),
+                "comment_date": a.get("date"),
+            })
 
-registros = encontrar_registros(dados)
+comments_df = pd.DataFrame(comments)
 
-# Normalização do JSON em tabela
-if registros:
-    df = pd.json_normalize(registros, sep=".")
+# Agrupar comentários por card_id
+if not comments_df.empty:
+    comments_df["comment_text"] = comments_df["comment_text"].fillna("").astype(str)
+    agg = comments_df.groupby("card_id")["comment_text"].apply(lambda x: " \n".join([t for t in x if t.strip()]))
+    comments_map = agg.to_dict()
 else:
-    df = pd.json_normalize(dados)
+    comments_map = {}
 
-st.subheader("Pré-visualização dos dados")
-st.dataframe(df.head(50), use_container_width=True)
+# -----------------------------
+# Funções de limpeza e classificação
+# -----------------------------
+def clean_text(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
-st.divider()
+def norm_for_rules(s: str) -> str:
+    s = "" if s is None else str(s).lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-# Seleção de colunas para métricas
-st.subheader("Configuração de métricas")
+# Regras simples e eficazes (baseline)
+TRUCK_KW = ["caminhao", "caminhão", "axor", "atego", "mb", "mercedes", "scania", "volvo", "carreta", "bitrem", "truck"]
+VEIC_KW  = ["carro", "passeio", "hb20", "onix", "gol", "palio", "civic", "corolla", "moto", "motocicleta"]
 
-colunas = ["(não usar)"] + list(df.columns)
+CATEGORIAS = {
+    "Acidente": ["acidente", "colis", "batida", "capot", "tombou", "saiu da pista"],
+    "Pane elétrica": ["pane eletrica", "pane elétrica", "bateria", "alternador", "não dá partida", "nao da partida", "curto", "fiação", "fiação"],
+    "Pane mecânica": ["pane mecanica", "pane mecânica", "motor", "cambio", "câmbio", "embreagem", "superaquec", "quebrou", "vazamento"],
+    "Guincho/Remoção": ["guincho", "reboque", "remoção", "remocao", "plataforma", "prancha"],
+    "Pneu": ["pneu", "estouro", "furou", "estepe", "calibr"],
+    "Chave/Trava": ["chave", "trava", "trancou", "chaveiro"],
+}
 
-col_valor = st.selectbox("Coluna de valor (R$)", colunas)
-col_distancia = st.selectbox("Coluna de distância (km)", colunas)
-col_tipo = st.selectbox("Coluna de tipo (ex: Truck / Veicular)", colunas)
-col_prestador = st.selectbox("Coluna de prestador", colunas)
-col_data = st.selectbox("Coluna de data", colunas)
+def classificar_tipo_veiculo(texto_norm: str) -> str:
+    t = texto_norm
+    truck = any(k in t for k in TRUCK_KW)
+    veic  = any(k in t for k in VEIC_KW)
+    if truck and not veic:
+        return "Truck"
+    if veic and not truck:
+        return "Veicular"
+    if truck and veic:
+        return "Misto"
+    return "Não identificado"
 
-# Conversões seguras
-def converter_numerico(col):
-    return pd.to_numeric(col, errors="coerce")
+def classificar_categoria(texto_norm: str) -> str:
+    for cat, kws in CATEGORIAS.items():
+        if any(k in texto_norm for k in kws):
+            return cat
+    return "Outros"
 
-if col_valor != "(não usar)":
-    df[col_valor] = converter_numerico(df[col_valor])
+# -----------------------------
+# Montar dataset final (texto_total)
+# -----------------------------
+# Campos comuns do Trello
+id_col = "id" if "id" in cards_df.columns else None
+name_col = "name" if "name" in cards_df.columns else None
+desc_col = "desc" if "desc" in cards_df.columns else None
+closed_col = "closed" if "closed" in cards_df.columns else None
+last_col = "dateLastActivity" if "dateLastActivity" in cards_df.columns else None
+closed_date_col = "dateClosed" if "dateClosed" in cards_df.columns else None
 
-if col_distancia != "(não usar)":
-    df[col_distancia] = converter_numerico(df[col_distancia])
+df = cards_df.copy()
 
-if col_data != "(não usar)":
-    df[col_data] = pd.to_datetime(df[col_data], errors="coerce")
+if id_col is None:
+    st.error("Não encontrei coluna 'id' nos cards.")
+    st.stop()
 
-# KPIs
-st.subheader("Indicadores principais")
+df["title"] = df[name_col].fillna("").astype(str) if name_col else ""
+df["desc_clean"] = df[desc_col].apply(clean_text) if desc_col else ""
+df["comments_clean"] = df[id_col].map(lambda cid: clean_text(comments_map.get(cid, "")))
 
-k1, k2, k3, k4 = st.columns(4)
-
-k1.metric("Quantidade de registros", len(df))
-
-if col_valor != "(não usar)":
-    total = df[col_valor].sum()
-    k2.metric("Valor total (R$)", f"{total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-else:
-    k2.metric("Valor total (R$)", "-")
-
-if col_valor != "(não usar)":
-    media = df[col_valor].mean()
-    k3.metric("Ticket médio (R$)", f"{media:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-else:
-    k3.metric("Ticket médio (R$)", "-")
-
-if col_distancia != "(não usar)":
-    dist_media = df[col_distancia].mean()
-    k4.metric("Distância média (km)", f"{dist_media:.1f}".replace(".", ","))
-else:
-    k4.metric("Distância média (km)", "-")
-
-st.divider()
-
-# Gráficos
-c1, c2 = st.columns(2)
-
-with c1:
-    st.subheader("Top prestadores")
-    if col_prestador != "(não usar)":
-        ranking = df[col_prestador].astype(str).value_counts().head(10)
-        st.bar_chart(ranking)
-    else:
-        st.info("Selecione uma coluna de prestador.")
-
-with c2:
-    st.subheader("Valor por tipo")
-    if col_tipo != "(não usar)" and col_valor != "(não usar)":
-        tabela = df.groupby(col_tipo)[col_valor].sum().sort_values(ascending=False)
-        st.bar_chart(tabela)
-    else:
-        st.info("Selecione coluna de tipo e valor.")
-
-# Série temporal
-st.subheader("Evolução no tempo")
-
-if col_data != "(não usar)" and col_valor != "(não usar)":
-    serie = (
-        df.dropna(subset=[col_data])
-          .groupby(pd.Grouper(key=col_data, freq="D"))[col_valor]
-          .sum()
-    )
-    st.line_chart(serie)
-else:
-    st.info("Selecione colunas de data e valor para ver a evolução.")
+df["texto_total"] = (df["title"].fillna("") + "\n" + df["desc_clean"].fillna("") + "\n" + df["comments_clean"].fillna("")).str.strip()
+df["texto_norm"] = df["texto_total"].apply(norm_for_rule_]()_]()
