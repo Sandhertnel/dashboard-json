@@ -5,42 +5,28 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import re
 
-# ----------------------------
-# Config
-# ----------------------------
-st.set_page_config(page_title="Dashboard de Atendimentos", layout="wide")
+st.set_page_config(page_title="Dashboard de Atendimentos (2025)", layout="wide")
 
-# CSS leve (clean, alinhamento, espaçamento)
+# ---------- Tema/estética clean ----------
 st.markdown("""
 <style>
 .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-h1, h2, h3 {letter-spacing: .2px;}
-.small-muted {color: rgba(229,231,235,.75); font-size: 0.9rem;}
-.kpi-card {padding: 14px 14px 10px 14px; border-radius: 12px; border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.03);}
-.kpi-label {font-size: .82rem; color: rgba(229,231,235,.7); margin-bottom: 6px;}
-.kpi-value {font-size: 1.6rem; font-weight: 700; line-height: 1.1;}
-.kpi-sub {font-size: .78rem; color: rgba(229,231,235,.55); margin-top: 4px;}
-.hr {border-top: 1px solid rgba(255,255,255,.08); margin: 1rem 0;}
+.small-muted {color: rgba(120,120,120,.95); font-size: 0.9rem;}
+.kpi-card {padding: 14px 14px 10px 14px; border-radius: 12px;
+           border: 1px solid rgba(0,0,0,.08); background: rgba(0,0,0,.02);}
+.kpi-label {font-size: .82rem; color: rgba(0,0,0,.65); margin-bottom: 6px;}
+.kpi-value {font-size: 1.6rem; font-weight: 800; line-height: 1.1;}
+.kpi-sub {font-size: .78rem; color: rgba(0,0,0,.55); margin-top: 4px;}
+.hr {border-top: 1px solid rgba(0,0,0,.08); margin: 1rem 0;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Dashboard de Atendimentos")
-st.markdown('<div class="small-muted">Entrada: Excel/CSV • Saída: KPIs, séries temporais, ranking e base filtrada</div>', unsafe_allow_html=True)
+st.title("Dashboard de Atendimentos — 2025")
+st.markdown('<div class="small-muted">Fonte: Excel mensal por aba • Visão clean (Power BI style) • Base completa</div>', unsafe_allow_html=True)
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def money_to_float(s: pd.Series) -> pd.Series:
-    x = s.astype(str).str.replace("R$", "", regex=False).str.strip()
-    x = x.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    return pd.to_numeric(x, errors="coerce")
-
-def km_to_float(s: pd.Series) -> pd.Series:
-    x = s.astype(str).str.lower().str.replace("km", "", regex=False).str.strip()
-    x = x.str.replace(",", ".", regex=False)
-    return pd.to_numeric(x, errors="coerce")
-
+# ---------- Helpers ----------
 def br_money(v):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "—"
     return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
@@ -59,183 +45,224 @@ def kpi(label, value, sub=""):
     </div>
     """, unsafe_allow_html=True)
 
-# ----------------------------
-# Upload
-# ----------------------------
-up = st.file_uploader("Envie sua planilha (.xlsx ou .csv)", type=["xlsx","csv"])
+def money_to_float(s: pd.Series) -> pd.Series:
+    x = s.astype(str).str.replace(r"[Rr]\$\s*", "", regex=True).str.strip()
+    x = x.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(x, errors="coerce")
+
+# Detecta a linha do cabeçalho (resolve Unnamed)
+def detect_header_row(excel_file, sheet_name: str) -> int:
+    raw = pd.read_excel(excel_file, sheet_name=sheet_name, header=None)
+    # procurar uma linha que contenha "CLIENTE" e "PROTOCOLO"
+    for i in range(min(25, len(raw))):
+        row = raw.iloc[i].astype(str).str.strip().str.upper()
+        vals = set(row.values)
+        if "CLIENTE" in vals and "PROTOCOLO" in vals:
+            return i
+    # fallback: linha com mais campos preenchidos
+    counts = [raw.iloc[i].notna().sum() for i in range(min(25, len(raw)))]
+    return int(np.argmax(counts)) if counts else 0
+
+def read_sheet_clean(excel_file, sheet_name: str):
+    hr = detect_header_row(excel_file, sheet_name)
+    df = pd.read_excel(excel_file, sheet_name=sheet_name, header=hr)
+
+    # remove colunas "Unnamed"
+    df = df.loc[:, ~df.columns.astype(str).str.contains(r"^Unnamed", na=False)]
+
+    # limpa nomes
+    df.columns = [str(c).strip() for c in df.columns]
+
+    return df, hr
+
+def safe_col(df, name_candidates):
+    # encontra coluna por match "case-insensitive"
+    cols = list(df.columns)
+    low = {c.lower(): c for c in cols}
+    for cand in name_candidates:
+        for c in cols:
+            if cand.lower() == c.lower():
+                return c
+    # fallback por contém
+    for cand in name_candidates:
+        for c in cols:
+            if cand.lower() in c.lower():
+                return c
+    return None
+
+# ---------- Upload ----------
+up = st.file_uploader("Envie a planilha (xlsx)", type=["xlsx"])
 if not up:
-    st.info("Envie um arquivo para iniciar.")
+    st.info("Envie o arquivo .xlsx para iniciar.")
     st.stop()
 
-# Load
-if up.name.lower().endswith(".csv"):
-    df = pd.read_csv(up)
-    aba = None
-else:
-    xls = pd.ExcelFile(up)
-    aba = st.selectbox("Aba (Excel)", xls.sheet_names)
-    df = pd.read_excel(up, sheet_name=aba)
+# Abas: manter só as mensais (remover '5' e limpar espaços)
+xls = pd.ExcelFile(up)
+raw_sheets = xls.sheet_names
+sheets = []
+for s in raw_sheets:
+    s_clean = s.strip()
+    # ignora abas claramente não-mensais (ex: "5")
+    if re.fullmatch(r"\d+", s_clean):
+        continue
+    sheets.append(s_clean)
 
-df.columns = [str(c).strip() for c in df.columns]
+sheet = st.selectbox("Mês (aba)", sheets)
 
-with st.expander("Pré-visualização (primeiras linhas)", expanded=False):
+df, header_row = read_sheet_clean(up, sheet)
+st.caption(f"Cabeçalho detectado na linha: {header_row+1} (contagem humana) • Colunas: {len(df.columns)}")
+
+with st.expander("Prévia (primeiras linhas)", expanded=False):
     st.dataframe(df.head(30), use_container_width=True)
 
-# ----------------------------
-# Mapping (sidebar)
-# ----------------------------
-st.sidebar.header("Mapeamento")
-cols = ["(não usar)"] + list(df.columns)
-
-c_data  = st.sidebar.selectbox("Data", cols, index=0)
-c_valor = st.sidebar.selectbox("Valor (R$)", cols, index=0)
-c_km    = st.sidebar.selectbox("Distância (km)", cols, index=0)
-c_prest = st.sidebar.selectbox("Prestador", cols, index=0)
-c_tipo  = st.sidebar.selectbox("Tipo (Truck/Veicular)", cols, index=0)
-c_reg   = st.sidebar.selectbox("Região/Cidade", cols, index=0)
-c_placa = st.sidebar.selectbox("Placa", cols, index=0)
+# ---------- Auto-mapeamento (baseado no seu arquivo real) ----------
+col_data = safe_col(df, ["DATA ATENDIMENTO"])
+col_valor = safe_col(df, ["VALOR"])
+col_prest = safe_col(df, ["PRESTADOR"])
+col_reg = safe_col(df, ["REGIONAL"])
+col_placa = safe_col(df, ["PLACA"])
+col_tipo = safe_col(df, ["TIPO DE VEICULO"])
+col_prot = safe_col(df, ["PROTOCOLO"])
 
 work = df.copy()
-work["_data"] = pd.to_datetime(work[c_data], errors="coerce", dayfirst=True) if c_data!="(não usar)" else pd.NaT
-work["_valor"] = money_to_float(work[c_valor]) if c_valor!="(não usar)" else np.nan
-work["_km"] = km_to_float(work[c_km]) if c_km!="(não usar)" else np.nan
-work["_prestador"] = work[c_prest].astype(str).str.strip() if c_prest!="(não usar)" else ""
-work["_tipo"] = work[c_tipo].astype(str).str.strip() if c_tipo!="(não usar)" else "Indefinido"
-work["_regiao"] = work[c_reg].astype(str).str.strip() if c_reg!="(não usar)" else ""
-work["_placa"] = work[c_placa].astype(str).str.strip() if c_placa!="(não usar)" else ""
 
-# ----------------------------
-# Filters (sidebar)
-# ----------------------------
+# normalizações (se existirem)
+work["_data"] = pd.to_datetime(work[col_data], errors="coerce", dayfirst=True) if col_data else pd.NaT
+work["_valor"] = money_to_float(work[col_valor]) if col_valor else np.nan
+work["_prestador"] = work[col_prest].astype(str).str.strip() if col_prest else ""
+work["_regional"] = work[col_reg].astype(str).str.strip() if col_reg else ""
+work["_placa"] = work[col_placa].astype(str).str.strip() if col_placa else ""
+work["_tipo"] = work[col_tipo].astype(str).str.strip() if col_tipo else ""
+work["_protocolo"] = work[col_prot].astype(str).str.strip() if col_prot else ""
+
+# ---------- Filtros (corporativo) ----------
 st.sidebar.header("Filtros")
 
 if work["_data"].notna().any():
     dmin = work["_data"].min().date()
     dmax = work["_data"].max().date()
-    di, dfim = st.sidebar.date_input("Período", (dmin, dmax))
-    work = work[(work["_data"].dt.date>=di) & (work["_data"].dt.date<=dfim)].copy()
-else:
-    di = dfim = None
+    di, dfim = st.sidebar.date_input("Período (dentro do mês)", (dmin, dmax))
+    work = work[(work["_data"].dt.date >= di) & (work["_data"].dt.date <= dfim)].copy()
 
-if c_tipo!="(não usar)":
-    tipos = sorted([t for t in work["_tipo"].dropna().unique() if t and t.lower()!="nan"])
-    sel_t = st.sidebar.multiselect("Tipo", tipos, default=tipos)
-    if sel_t: work = work[work["_tipo"].isin(sel_t)].copy()
+if col_prest:
+    prests = sorted([p for p in work["_prestador"].dropna().unique() if p and p.lower()!="nan" and p.strip()!="*"])
+    sel_p = st.sidebar.multiselect("Prestador", prests, default=prests[:25] if len(prests)>25 else prests)
+    if sel_p:
+        work = work[work["_prestador"].isin(sel_p)].copy()
 
-if c_prest!="(não usar)":
-    prests = sorted([p for p in work["_prestador"].dropna().unique() if p and p.lower()!="nan"])
-    sel_p = st.sidebar.multiselect("Prestador", prests, default=prests[:30] if len(prests)>30 else prests)
-    if sel_p: work = work[work["_prestador"].isin(sel_p)].copy()
+if col_reg:
+    regs = sorted([r for r in work["_regional"].dropna().unique() if r and r.lower()!="nan"])
+    sel_r = st.sidebar.multiselect("Regional", regs, default=regs)
+    if sel_r:
+        work = work[work["_regional"].isin(sel_r)].copy()
 
-if c_reg!="(não usar)":
-    regs = sorted([r for r in work["_regiao"].dropna().unique() if r and r.lower()!="nan"])
-    sel_r = st.sidebar.multiselect("Região", regs, default=regs)
-    if sel_r: work = work[work["_regiao"].isin(sel_r)].copy()
+q = st.sidebar.text_input("Buscar (placa/protocolo/beneficiário)")
+if q.strip():
+    qq = q.strip().lower()
+    target_cols = []
+    for cand in ["PLACA", "BENEFICIARIO", "PROTOCOLO", "MODELO", "MARCA", "SERVIÇO", "FATO"]:
+        c = safe_col(work, [cand])
+        if c: target_cols.append(c)
+    # fallback: usa as técnicas
+    target_cols += ["_placa","_protocolo"]
 
-# ----------------------------
-# Header context
-# ----------------------------
-ctx = []
-ctx.append(f"Registros: **{len(work):,}**".replace(",", "."))
-if di and dfim:
-    ctx.append(f"Período: **{di.strftime('%d/%m/%Y')} → {dfim.strftime('%d/%m/%Y')}**")
-ctx.append(f"Fonte: **{up.name}**" + (f" • Aba: **{aba}**" if aba else ""))
+    mask = False
+    for c in dict.fromkeys(target_cols):  # unique preservando ordem
+        if c in work.columns:
+            mask = mask | work[c].astype(str).str.lower().str.contains(re.escape(qq), na=False)
+    work = work[mask].copy()
+
+# ---------- Contexto ----------
+ctx = [f"Mês/Aba: **{sheet}**", f"Registros: **{len(work):,}**".replace(",", ".")]
 st.markdown(" • ".join(ctx))
-
 st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-# ----------------------------
-# KPIs (clean)
-# ----------------------------
-kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
+# ---------- KPIs ----------
+c1,c2,c3,c4,c5,c6 = st.columns(6)
 
-with kpi1:
+with c1:
     kpi("Atendimentos", f"{len(work):,}".replace(",", "."), "Registros no recorte")
-with kpi2:
-    kpi("Valor total (R$)", "—" if work["_valor"].isna().all() else br_money(work["_valor"].sum(skipna=True)), "Soma do recorte")
-with kpi3:
-    kpi("Ticket médio (R$)", "—" if work["_valor"].isna().all() else br_money(work["_valor"].mean(skipna=True)), "Média do recorte")
-with kpi4:
-    kpi("KM total", "—" if work["_km"].isna().all() else br_num(work["_km"].sum(skipna=True), 1), "Soma do recorte")
-with kpi5:
-    kpi("KM médio", "—" if work["_km"].isna().all() else br_num(work["_km"].mean(skipna=True), 1), "Média do recorte")
-with kpi6:
-    quality = (work["_prestador"].astype(str).str.strip()!="").mean()*100 if len(work) else 0
-    kpi("Qualidade (Prestador)", f"{quality:.1f}%", "% com prestador preenchido")
+with c2:
+    total = work["_valor"].sum(skipna=True) if work["_valor"].notna().any() else np.nan
+    kpi("Valor total (R$)", br_money(total), "Soma (recorte)")
+with c3:
+    avg = work["_valor"].mean(skipna=True) if work["_valor"].notna().any() else np.nan
+    kpi("Ticket médio (R$)", br_money(avg), "Média (recorte)")
+with c4:
+    qprest = (work["_prestador"].astype(str).str.strip().ne("").mean()*100) if len(work) else 0
+    kpi("Qualidade (Prestador)", f"{qprest:.1f}%", "% preenchido")
+with c5:
+    qplaca = (work["_placa"].astype(str).str.strip().ne("").mean()*100) if len(work) else 0
+    kpi("Qualidade (Placa)", f"{qplaca:.1f}%", "% preenchido")
+with c6:
+    qprot = (work["_protocolo"].astype(str).str.strip().ne("").mean()*100) if len(work) else 0
+    kpi("Qualidade (Protocolo)", f"{qprot:.1f}%", "% preenchido")
 
-# ----------------------------
-# Tabs
-# ----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Visão Geral", "Prestadores", "Regiões", "Base"])
+# ---------- Abas ----------
+tab1, tab2, tab3 = st.tabs(["Visão Geral", "Prestadores", "Base (todas as colunas)"])
 
 with tab1:
-    c1, c2 = st.columns(2)
+    colA, colB = st.columns(2)
 
-    with c1:
-        st.subheader("Atendimentos ao longo do tempo")
+    with colA:
+        st.subheader("Atendimentos por dia")
         if work["_data"].notna().any():
             tmp = work.dropna(subset=["_data"]).copy()
-            tmp["mes"] = tmp["_data"].dt.to_period("M").astype(str)
-            serie = tmp.groupby("mes").size().reset_index(name="qtd")
-            st.plotly_chart(px.line(serie, x="mes", y="qtd", markers=True), use_container_width=True)
+            tmp["dia"] = tmp["_data"].dt.date.astype(str)
+            g = tmp.groupby("dia").size().reset_index(name="qtd")
+            st.plotly_chart(px.line(g, x="dia", y="qtd", markers=True), use_container_width=True)
         else:
-            st.info("Mapeie a coluna de data para habilitar a série temporal.")
+            st.info("Sem coluna de data válida para série diária.")
 
-    with c2:
-        st.subheader("Valor ao longo do tempo")
+    with colB:
+        st.subheader("Valor por dia")
         if work["_data"].notna().any() and work["_valor"].notna().any():
             tmp = work.dropna(subset=["_data"]).copy()
-            tmp["mes"] = tmp["_data"].dt.to_period("M").astype(str)
-            g = tmp.groupby("mes")["_valor"].sum().reset_index()
-            st.plotly_chart(px.line(g, x="mes", y="_valor", markers=True), use_container_width=True)
+            tmp["dia"] = tmp["_data"].dt.date.astype(str)
+            g = tmp.groupby("dia")["_valor"].sum().reset_index()
+            st.plotly_chart(px.line(g, x="dia", y="_valor", markers=True), use_container_width=True)
         else:
-            st.info("Mapeie data e valor para habilitar a série de custo.")
+            st.info("Sem data/valor válidos para série de custo.")
 
 with tab2:
     st.subheader("Ranking de prestadores")
     tmp = work.copy()
-    tmp["_prestador"] = tmp["_prestador"].astype(str).str.strip()
-    tmp = tmp[tmp["_prestador"]!=""]
+    tmp = tmp[tmp["_prestador"].astype(str).str.strip().ne("") & (tmp["_prestador"].astype(str).str.strip()!="*")]
 
     if len(tmp):
-        colA, colB = st.columns(2)
-
-        with colA:
+        a,b = st.columns(2)
+        with a:
             topq = tmp.groupby("_prestador").size().sort_values(ascending=False).head(20).reset_index(name="qtd")
             st.plotly_chart(px.bar(topq, x="qtd", y="_prestador", orientation="h"), use_container_width=True)
-
-        with colB:
+        with b:
             if tmp["_valor"].notna().any():
                 topv = tmp.groupby("_prestador")["_valor"].sum().sort_values(ascending=False).head(20).reset_index()
                 st.plotly_chart(px.bar(topv, x="_valor", y="_prestador", orientation="h"), use_container_width=True)
             else:
-                st.info("Mapeie a coluna de valor para ranking por custo.")
+                st.info("Sem valor válido para ranking por custo.")
     else:
-        st.info("Sem prestador preenchido no recorte.")
+        st.info("Sem prestador preenchido no recorte atual.")
 
 with tab3:
-    st.subheader("Regiões")
-    if c_reg!="(não usar)" and work["_regiao"].astype(str).str.strip().ne("").any():
-        g = work.groupby("_regiao").size().sort_values(ascending=False).head(25).reset_index(name="qtd")
-        st.plotly_chart(px.bar(g, x="qtd", y="_regiao", orientation="h"), use_container_width=True)
-    else:
-        st.info("Mapeie a coluna de região/cidade para habilitar esta aba.")
+    st.subheader("Base completa (todas as colunas)")
+    # principais primeiro (se existirem), depois TODAS as demais
+    prefer = []
+    for c in [col_data, col_reg, col_prest, col_valor, col_placa, col_prot, col_tipo]:
+        if c and c in df.columns and c not in prefer:
+            prefer.append(c)
 
-with tab4:
-    st.subheader("Base filtrada (clean)")
-    # colunas principais primeiro
-    prefer = ["_data","_tipo","_prestador","_valor","_km","_regiao","_placa"]
-    prefer = [c for c in prefer if c in work.columns]
-    cols = prefer + [c for c in work.columns if c not in prefer]
+    restantes = [c for c in df.columns if c not in prefer]
+    cols_ordenadas = prefer + restantes
 
-    st.dataframe(work[cols], use_container_width=True, height=520)
+    st.dataframe(work[cols_ordenadas], use_container_width=True, height=650)
+    st.caption(f"Total de colunas exibidas: {len(cols_ordenadas)}")
 
     st.download_button(
-        "Baixar CSV do recorte",
-        work[cols].to_csv(index=False, encoding="utf-8-sig"),
-        "atendimentos_filtrados.csv",
+        "Baixar CSV do recorte (todas as colunas)",
+        work[cols_ordenadas].to_csv(index=False, encoding="utf-8-sig"),
+        "atendimentos_recorte_completo.csv",
         "text/csv"
     )
 ''', encoding="utf-8")
 
-print("app.py (Power BI clean) criado")
+print("app.py atualizado para o seu Excel (cabeçalho automático + filtro por aba + base completa)")
